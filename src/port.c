@@ -87,12 +87,17 @@
 /* Hardware constants for Timer2. */
     #warning "Timer2 used for scheduler."
     #define    portSCHEDULER_ISR        TIMER2_COMPA_vect
+    #define portCLEAR_COUNTER_ON_MATCH  ( (uint8_t) _BV(WGM21) )
+    //#define portPRESCALE_1024           ( (uint8_t) (_BV(CS22) ) )
+    //#define portCLOCK_PRESCALER         ( (uint32_t) 64 )
+    #define portPRESCALE_1024           ( (uint8_t) (_BV(CS22)|_BV(CS21)|_BV(CS20) ) )
+    #define portCLOCK_PRESCALER         ( (uint32_t) 1024 )
     #define portCOMPARE_MATCH_A_INTERRUPT_ENABLE    ( (uint8_t) _BV(OCIE2A) )
     #define portOCRL                    OCR2A
     #define portTCCRa                   TCCR2A
     #define portTCCRb                   TCCR2B
     #define portTIMSK                   TIMSK2
-    #define portTCNT                    TCNT2
+    //#define portTCNT                    TCNT2
     #define portTIFR                    TIFR2
 
 #elif defined( portUSE_TIMER3 )
@@ -718,7 +723,7 @@ void vPortEndScheduler( void )
 
 #elif defined( portUSE_TIMER2 )
     portTIMSK &= ~( _BV(OCIE2B)|_BV(OCIE2A)|_BV(TOIE2) );   /* disable all Timer2 interrupts */
-    ASSR = 0x00;                                            /* set Timer/Counter2 to be off */
+    //ASSR = 0x00;                                            /* set Timer/Counter2 to be off */
 
 #elif defined( portUSE_TIMER3 )
     portTIMSK &= ~( _BV(OCIE3B)|_BV(OCIE3A)|_BV(TOIE3) );   /* disable all Timer3 interrupts */
@@ -726,6 +731,47 @@ void vPortEndScheduler( void )
 #endif
 }
 /*-----------------------------------------------------------*/
+
+/*
+ * Choose which delay function to use.
+ * Arduino delay() is a millisecond granularity busy wait, that
+ * that breaks FreeRTOS. So its use is limited to less than one
+ * System Tick (portTICK_PERIOD_MS milliseconds).
+ * FreeRTOS vTaskDelay() is relies on the System Tick which here
+ * has a granularity of portTICK_PERIOD_MS milliseconds (15ms),
+ * with the remainder implemented as an Arduino delay().
+ */
+
+#ifdef delay
+#undef delay
+#endif
+
+extern void delay ( unsigned long ms );
+
+//#if defined( portUSE_WDTO )
+void vPortDelay( const uint32_t ms ) __attribute__ ( ( hot, flatten ) );
+void vPortDelay( const uint32_t ms )
+{
+    if ( ms < portTICK_PERIOD_MS )
+    {
+        delay( (unsigned long) (ms) );
+    }
+    else
+    {
+        vTaskDelay( (TickType_t) (ms / portTICK_PERIOD_MS) );
+        delay( (unsigned long) ( (ms - portTICK_PERIOD_MS) % portTICK_PERIOD_MS ) );
+    }
+}
+// #else
+// #warning "The user is responsible to provide function `vPortDelay()`"
+// #warning "Arduino uses all AVR MCU Timers, so breakage may occur"
+// extern void vPortDelay( const uint32_t ms ) __attribute__ ( ( hot, flatten ) );
+// #endif
+/*-----------------------------------------------------------*/
+
+
+
+
 
 /*
  * Manual context switch. The first thing we do is save the registers so we
@@ -893,60 +939,75 @@ uint8_t ucLowByte;
 
 void prvSetupTimerInterrupt( void )
 {
-    uint16_t usCompareMatch;
+uint32_t ulCompareMatch;
+#ifdef portOCRH
+uint8_t ucHighByte;
+#endif
+uint8_t ucLowByte;
 
-    /* Using 8bit Timer2 to generate the tick.  A 32.768 KHz crystal
-     * must be attached to the appropriate pins.  We then adjust the number
-     * to a power of two so we can get EXACT seconds for the Real Time clock.
-     */
+    portTCCRa = 0;
+    portTCCRb = 0;
 
-    usCompareMatch = (uint16_t) ((uint32_t) 32768) / configTICK_RATE_HZ;
+    /* Using 8bit Timer0 or 16bit Timer1 or Timer3 to generate the tick. Correct fuses must be
+    selected for the configCPU_CLOCK_HZ clock.*/
 
-    if ( usCompareMatch > 192 )
-    {
-        usCompareMatch = 256;
-    }
-    else
-    {
-        for (uint8_t i = 7; i >= 1; --i)
-        {
-            if ( usCompareMatch & ((uint16_t)1 << i) )
-            {
-                /* found the power - now let's see if we round up or down */
-                if ( usCompareMatch & ((uint16_t)1 << (i-1)) )
-                {
-                    usCompareMatch = ((uint16_t)1 << (i+1));
-                }
-                else
-                {
-                    usCompareMatch = ((uint16_t)1 << i);
-                }
-                break;
-            }
-        }
-    }
+    // ulCompareMatch 40,000 = 20,000,000 / 500; 20MHz
+    // ulCompareMatch 110,592 = 22,118,400 / 200; 22.1184 MHz
+    ulCompareMatch = configCPU_CLOCK_HZ / configTICK_RATE_HZ;
 
-    /* actual port tick rate in Hz, calculated */
-    portTickRateHz = (TickType_t) ((uint32_t) 32768 / usCompareMatch );
+    /* We only have 8 or 16 bits so have to scale 64 or 256 to get our required tick rate. */
+    //ulCompareMatch = 625 /= portCLOCK_PRESCALER; 20MHz with 64 prescale
+    //ulCompareMatch = 108 /= portCLOCK_PRESCALER; 22.1184 MHz with 1024 prescale
+    ulCompareMatch /= portCLOCK_PRESCALER;
+
+     /* actual port tick rate in Hz, calculated */
+    portTickRateHz = (TickType_t) ((uint32_t) configCPU_CLOCK_HZ / ( portCLOCK_PRESCALER * ulCompareMatch ));
     /* initialise first second of ticks */
     ticksRemainingInSec = portTickRateHz;
 
     /* Adjust for correct value. */
-    usCompareMatch -= ( uint16_t ) 1;
+    ulCompareMatch -= ( uint32_t ) 1;
 
-    portTIMSK &= ~( _BV(OCIE2B)|_BV(OCIE2A)|_BV(TOIE2) );       // disable all Timer2 interrupts
-    portTIFR |=  _BV(OCF2B)|_BV(OCF2A)|_BV(TOV2);               // clear all pending interrupts
-    ASSR = _BV(AS2);                                            // set Timer/Counter2 to be asynchronous from the CPU clock
-                                                                // with a second external clock (32,768kHz) driving it.
-    portTCNT  = 0x00;                                           // zero out the counter
-    portTCCRa = _BV(WGM21);                                     // mode CTC (clear on counter match)
-    portTCCRb = _BV(CS20);                                      // divide timer clock by 1 (No prescaling)
-    portOCRL  = usCompareMatch;                                 // set the counter
+    /* Setup compare match value for compare match A. Interrupts are disabled
+    before this is called so we need not worry here. */
+    ucLowByte = ( uint8_t ) ( ulCompareMatch & ( uint32_t ) 0xff );
 
-    while( ASSR & (_BV(TCN2UB)|_BV(OCR2AUB)|_BV(TCR2AUB)));     // Wait until Timer2 update complete
+    //  OCR3AH = ucHighByte;
+    //  OCR3AL = ucLowByte;
 
-    /* Enable the interrupt - this is okay as interrupts are currently globally disabled. */
-    portTIMSK |= portCOMPARE_MATCH_A_INTERRUPT_ENABLE;          // interrupt on Timer2 compare match
+    // the HiByte is only needed, if a 16 Bit counter is being utilized
+#ifdef portOCRH
+    ulCompareMatch >>= 8;
+    ucHighByte = ( uint8_t ) ( ulCompareMatch & ( uint32_t) 0xff );
+    portOCRH = ucHighByte;
+#endif
+
+    portOCRL = ucLowByte;
+
+#if defined( portUSE_TIMER0 )
+    /* Setup clock source and compare match behaviour. Assuming 328p (no Timer3) */
+    portTCCRa = portCLEAR_COUNTER_ON_MATCH;
+    portTCCRb = portPRESCALE_1024;
+
+#elif defined( portUSE_TIMER1 )
+    /* Setup clock source and compare match behaviour. Assuming 328p (with Timer1) */
+    ucLowByte = portCLEAR_COUNTER_ON_MATCH | portPRESCALE_64;
+    portTCCRb = ucLowByte;
+
+#elif defined( portUSE_TIMER2 )
+    portTCCRa = portCLEAR_COUNTER_ON_MATCH;
+    portTCCRb = portPRESCALE_1024;
+
+#elif defined( portUSE_TIMER3 )
+    /* Setup clock source and compare match behaviour. Assuming  640 / 1280 /1281 / 1284p / 2560 / 2561 (with Timer3) */
+    ucLowByte = portCLEAR_COUNTER_ON_MATCH | portPRESCALE_64;
+    portTCCRb = ucLowByte;
+#endif
+
+    /* Enable the interrupt - this is okay as interrupt are currently globally disabled. */
+    ucLowByte = portTIMSK;
+    ucLowByte |= portCOMPARE_MATCH_A_INTERRUPT_ENABLE;
+    portTIMSK = ucLowByte;
 }
 #endif
 
